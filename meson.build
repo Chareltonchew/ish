@@ -33,8 +33,9 @@ includes = [include_directories('.')]
 threads = dependency('threads')
 librt = cc.find_library('rt', required: false)
 libm = cc.find_library('m', required: false)
+libdl = cc.find_library('dl', required: false)
 sqlite3 = cc.find_library('sqlite3')
-dependencies = [librt, libm, threads, sqlite3]
+dependencies = [librt, libm, libdl, threads, sqlite3]
 
 subdir('vdso') # ish depends on the vdso
 
@@ -122,6 +123,7 @@ if get_option('kernel') == 'ish'
 
         'fs/proc.c',
         'fs/proc/entry.c',
+        'fs/proc/ish.c',
         'fs/proc/root.c',
         'fs/proc/pid.c',
 
@@ -184,6 +186,7 @@ elif get_option('kernel') == 'linux'
         dependencies: [
             liblinux,
             libm,
+            libdl,
             threads,
             declare_dependency(link_whole: modules),
         ])

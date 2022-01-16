@@ -28,10 +28,12 @@ typedef struct linux_tty *tty_t;
 #endif
 }
 
-@property WKWebView *webView;
 @property BOOL loaded;
 @property (nonatomic) tty_t tty;
+// lock with dataLock for !linux and @synchronized(self) for linux
 @property (nonatomic) NSMutableData *pendingData;
+// sending output is an asynchronous thing due to javascript, this is used to ensure it doesn't happen twice at once
+@property (nonatomic) BOOL outputInProgress;
 
 @property DelayedUITask *refreshTask;
 @property DelayedUITask *scrollToBottomTask;
@@ -62,27 +64,39 @@ typedef struct linux_tty *tty_t;
 @end
 
 @implementation Terminal
+@synthesize webView = _webView;
 
-static const int BUF_SIZE = 4096;
+static const int BUF_SIZE = 1<<14;
 
 static NSMapTable<NSNumber *, Terminal *> *terminals;
 static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
 
 - (instancetype)initWithType:(int)type number:(int)num {
-    self.terminalsKey = @(dev_make(type, num));
-    Terminal *terminal = [terminals objectForKey:self.terminalsKey];
-    if (terminal)
-        return terminal;
-    
-    if (self = [super init]) {
-        self.pendingData = [[NSMutableData alloc] initWithCapacity:BUF_SIZE];
-        self.refreshTask = [[DelayedUITask alloc] initWithTarget:self action:@selector(refresh)];
-        self.scrollToBottomTask = [[DelayedUITask alloc] initWithTarget:self action:@selector(scrollToBottom)];
+    @synchronized (Terminal.class) {
+        self.terminalsKey = @(dev_make(type, num));
+        Terminal *terminal = [terminals objectForKey:self.terminalsKey];
+        if (terminal)
+            return terminal;
+
+        if (self = [super init]) {
+            self.pendingData = [[NSMutableData alloc] initWithCapacity:BUF_SIZE];
+            self.refreshTask = [[DelayedUITask alloc] initWithTarget:self action:@selector(refresh)];
+            self.scrollToBottomTask = [[DelayedUITask alloc] initWithTarget:self action:@selector(scrollToBottom)];
 #if !ISH_LINUX
-        lock_init(&_dataLock);
-        cond_init(&_dataConsumed);
+            lock_init(&_dataLock);
+            cond_init(&_dataConsumed);
 #endif
-        
+
+            [terminals setObject:self forKey:self.terminalsKey];
+            self.uuid = [NSUUID UUID];
+            [terminalsByUUID setObject:self forKey:self.uuid];
+        }
+        return self;
+    }
+}
+
+- (WKWebView *)webView {
+    if (_webView == nil) {
         WKWebViewConfiguration *config = [WKWebViewConfiguration new];
         [config.userContentController addScriptMessageHandler:self name:@"load"];
         [config.userContentController addScriptMessageHandler:self name:@"log"];
@@ -91,16 +105,12 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
         [config.userContentController addScriptMessageHandler:self name:@"propUpdate"];
         // Make the web view really big so that if a program tries to write to the terminal before it's displayed, the text probably won't wrap too badly.
         CGRect webviewSize = CGRectMake(0, 0, 10000, 10000);
-        self.webView = [[CustomWebView alloc] initWithFrame:webviewSize configuration:config];
-        self.webView.scrollView.scrollEnabled = NO;
+        _webView = [[CustomWebView alloc] initWithFrame:webviewSize configuration:config];
+        _webView.scrollView.scrollEnabled = NO;
         NSURL *xtermHtmlFile = [NSBundle.mainBundle URLForResource:@"term" withExtension:@"html"];
-        [self.webView loadFileURL:xtermHtmlFile allowingReadAccessToURL:xtermHtmlFile];
-        
-        [terminals setObject:self forKey:self.terminalsKey];
-        self.uuid = [NSUUID UUID];
-        [terminalsByUUID setObject:self forKey:self.uuid];
+        [_webView loadFileURL:xtermHtmlFile allowingReadAccessToURL:xtermHtmlFile];
     }
-    return self;
+    return _webView;
 }
 
 #if !ISH_LINUX
@@ -113,7 +123,9 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
 #endif
 
 - (void)setTty:(tty_t)tty {
-    _tty = tty;
+    @synchronized (self) {
+        _tty = tty;
+    }
     dispatch_async(dispatch_get_main_queue(), ^{
         [self syncWindowSize];
     });
@@ -129,7 +141,7 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
         NSLog(@"%@", message.body);
     } else if ([message.name isEqualToString:@"sendInput"]) {
         NSData *data = [message.body dataUsingEncoding:NSUTF8StringEncoding];
-        [self sendInput:data.bytes length:data.length];
+        [self sendInput:data];
     } else if ([message.name isEqualToString:@"resize"]) {
         [self syncWindowSize];
     } else if ([message.name isEqualToString:@"propUpdate"]) {
@@ -142,9 +154,8 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
 #if !ISH_LINUX
         int cols = dimensions[0].intValue;
         int rows = dimensions[1].intValue;
-        if (self.tty == NULL) {
+        if (self.tty == NULL)
             return;
-        }
         lock(&self.tty->lock);
         tty_set_winsize(self.tty, (struct winsize_) {.col = cols, .row = rows});
         unlock(&self.tty->lock);
@@ -165,7 +176,7 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
     if (!NSThread.isMainThread) {
         // The main thread is the only one that can unblock this, so sleeping here would be a deadlock.
         // The only reason for this to be called on the main thread is if input is echoed.
-        while (_pendingData == nil || _pendingData.length > BUF_SIZE)
+        while (_pendingData.length > BUF_SIZE)
             wait_for_ignore_signals(&_dataConsumed, &_dataLock, NULL);
     }
     [_pendingData appendData:[NSData dataWithBytes:buf length:len]];
@@ -187,20 +198,21 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
 
 #if ISH_LINUX
 - (int)roomForOutput {
-    if (_pendingData == nil || _pendingData.length > BUF_SIZE)
+    if (_pendingData.length > BUF_SIZE)
         return 0;
     return BUF_SIZE - (int) _pendingData.length;
 }
 #endif
 
-- (void)sendInput:(const char *)buf length:(size_t)len {
+- (void)sendInput:(NSData *)input {
     if (self.tty == NULL)
         return;
 #if !ISH_LINUX
-    tty_input(self.tty, buf, len, 0);
+    tty_input(self.tty, input.bytes, input.length, 0);
 #else
-    async_do_in_irq(^{
-        self.tty->ops->send_input(self.tty, buf, len);
+    async_do_in_workqueue(^{
+        NSData *inputRef = input;
+        self.tty->ops->send_input(self.tty, inputRef.bytes, inputRef.length);
     });
 #endif
     [self.webView evaluateJavaScript:@"exports.setUserGesture()" completionHandler:nil];
@@ -221,22 +233,30 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
 
 #if !ISH_LINUX
     lock(&_dataLock);
-    if (_pendingData == nil) {
+    if (_outputInProgress) {
         unlock(&_dataLock);
         [self.refreshTask schedule];
         return;
     }
     NSData *data = _pendingData;
+    _pendingData = [[NSMutableData alloc] initWithCapacity:BUF_SIZE];
+    _outputInProgress = YES;
+    notify(&self->_dataConsumed);
     unlock(&_dataLock);
 #else
     NSData *data;
     @synchronized (self) {
-        if (_pendingData == nil) {
+        if (_outputInProgress) {
             [self.refreshTask schedule];
             return;
         }
         data = _pendingData;
         _pendingData = [[NSMutableData alloc] initWithCapacity:BUF_SIZE];
+        _outputInProgress = YES;
+        if (self->_tty)
+            async_do_in_irq(^{
+                self->_tty->ops->can_output(self->_tty);
+            });
     }
 #endif
 
@@ -250,17 +270,11 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
     [self.webView evaluateJavaScript:jsToEvaluate completionHandler:^(id result, NSError *error) {
 #if !ISH_LINUX
         lock(&self->_dataLock);
-        self->_pendingData = [[NSMutableData alloc] initWithCapacity:BUF_SIZE];
-        notify(&self->_dataConsumed);
+        self->_outputInProgress = NO;
         unlock(&self->_dataLock);
 #else
         @synchronized (self) {
-            self->_pendingData = [[NSMutableData alloc] initWithCapacity:BUF_SIZE];
-        }
-        if (self->_tty) {
-            async_do_in_irq(^{
-                self->_tty->ops->wakeup(self->_tty);
-            });
+            self->_outputInProgress = NO;
         }
 #endif
         if (error != nil) {
@@ -289,19 +303,27 @@ static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
 }
 
 + (Terminal *)terminalWithUUID:(NSUUID *)uuid {
-    return [terminalsByUUID objectForKey:uuid];
+    @synchronized (Terminal.class) {
+        return [terminalsByUUID objectForKey:uuid];
+    }
 }
 
 - (void)destroy {
-#if !ISH_LINUX
-    struct tty *tty = self.tty;
+    tty_t tty = self.tty;
     if (tty != NULL) {
-        lock(&tty->lock);
-        tty_hangup(tty);
-        unlock(&tty->lock);
-    }
+#if !ISH_LINUX
+        if (tty != NULL) {
+            lock(&tty->lock);
+            tty_hangup(tty);
+            unlock(&tty->lock);
+        }
+#else
+        tty->ops->hangup(tty);
 #endif
-    [terminals removeObjectForKey:self.terminalsKey];
+    }
+    @synchronized (Terminal.class) {
+        [terminals removeObjectForKey:self.terminalsKey];
+    }
 }
 
 + (void)initialize {
